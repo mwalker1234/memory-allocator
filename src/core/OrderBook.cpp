@@ -1,134 +1,268 @@
+#pragma once
 #include <atomic>
-#include <cstdint>
+#include <functional>
+#include <array>
+#include <cstddef>
 
-// Forward‑declare
+// Forward declarations
 struct Order;
 struct Limit;
 
-// Your existing Order struct — we’ll only touch the link fields:
+// ==================== Order ====================
 struct Order {
-    int         idNumber;
-    bool        buyOrSell;
-    int         shares;
-    int         limit;
-    int         entryTime;
-    int         eventTime;
-
-    // these become atomic only if you need concurrent list ops:
-    Order*      nextOrder;
-    Order*      prevOrder;
-    Limit*      parentLimit;
+    int             idNumber;
+    bool            buyOrSell;
+    int             shares;
+    int             limitPrice;
+    int             entryTime;
+    int             eventTime;
+    Order*          nextOrder;
+    Order*          prevOrder;
+    Limit*          parentLimit;
 };
 
-// Limit becomes our tree‑node:
+// ==================== Limit (tree node) ====================
 struct Limit {
-    int                  limitPrice;
-    std::atomic<int>     size;         // # orders at this price
-    std::atomic<int64_t> totalVolume;  // sum of shares
+    int                     limitPrice;
+    std::atomic<int>        size;
+    std::atomic<long long>  totalVolume;
 
-    // tree links
-    std::atomic<Limit*>  parent;
-    std::atomic<Limit*>  leftChild;
-    std::atomic<Limit*>  rightChild;
+    // BST links
+    std::atomic<Limit*>     parent;
+    std::atomic<Limit*>     leftChild;
+    std::atomic<Limit*>     rightChild;
 
-    // head/tail of your per‑limit doubly‑linked order list:
-    std::atomic<Order*>  headOrder;
-    std::atomic<Order*>  tailOrder;
+    // Per-limit doubly-linked order list
+    std::atomic<Order*>     headOrder;
+    std::atomic<Order*>     tailOrder;
 
     Limit(int price)
-      : limitPrice(price),
-        size(0), totalVolume(0),
-        parent(nullptr),
-        leftChild(nullptr),
-        rightChild(nullptr),
-        headOrder(nullptr),
-        tailOrder(nullptr)
+      : limitPrice(price), size(0), totalVolume(0),
+        parent(nullptr), leftChild(nullptr), rightChild(nullptr),
+        headOrder(nullptr), tailOrder(nullptr)
     {}
 };
 
-class OrderBook {
-    // roots of two BSTs:
-    std::atomic<Limit*>  buyTree{nullptr};
-    std::atomic<Limit*>  sellTree{nullptr};
+// ==================== LockFreeHashMap ====================
+// Simple, fixed-size, separate-chaining hash map (no dynamic resizing)
+template<typename K, typename V, std::size_t BUCKETS = 1024>
+class LockFreeHashMap {
+    struct Node {
+        K                   key;
+        std::atomic<V>      value;
+        std::atomic<Node*>  next;
+        Node(const K& k, V v)
+          : key(k), value(v), next(nullptr)
+        {}
+    };
 
-    // cached “inside” pointers:
-    std::atomic<Limit*>  highestBuy{nullptr};
-    std::atomic<Limit*>  lowestSell{nullptr};
+    std::array<std::atomic<Node*>, BUCKETS> buckets;
+    std::hash<K> hasher;
 
-  public:
-    // lookup or insert a Limit node in the appropriate tree
-    Limit* findOrInsertLimit(bool isBuySide, int price) {
-        auto& root = isBuySide ? buyTree : sellTree;
-        while (true) {
-            // 1) Search down to a null child
-            Limit* parent = nullptr;
-            Limit* cur    = root.load(std::memory_order_acquire);
-            while (cur) {
-                if (price == cur->limitPrice)
-                    return cur;           // found existing
-                parent = cur;
-                if (price < cur->limitPrice)
-                    cur = cur->leftChild.load(std::memory_order_acquire);
-                else
-                    cur = cur->rightChild.load(std::memory_order_acquire);
-            }
-
-            // 2) Not found: allocate new node
-            Limit* newNode = new Limit(price);
-
-            // 3) Try to link it in atomically
-            if (!parent) {
-                // Tree was empty
-                if (root.compare_exchange_strong(cur, newNode,
-                                                 std::memory_order_acq_rel))
-                {
-                    updateInsidePointer(isBuySide, newNode);
-                    return newNode;
-                }
-            }
-            else {
-                auto& childPtr = (price < parent->limitPrice)
-                                  ? parent->leftChild
-                                  : parent->rightChild;
-
-                if (childPtr.compare_exchange_strong(cur, newNode,
-                                                     std::memory_order_acq_rel))
-                {
-                    newNode->parent.store(parent,
-                                          std::memory_order_release);
-                    updateInsidePointer(isBuySide, newNode);
-                    return newNode;
-                }
-            }
-
-            // CAS failed → someone else inserted there first
-            delete newNode;
-            // retry whole search/insert
+public:
+    LockFreeHashMap() {
+        for (auto &b : buckets) {
+            b.store(nullptr, std::memory_order_relaxed);
         }
     }
 
-  private:
-    // Maintain highestBuy or lowestSell
-    void updateInsidePointer(bool isBuySide, Limit* candidate) {
+    // Insert or overwrite
+    bool insert(const K& key, V val) {
+        std::size_t idx = hasher(key) % BUCKETS;
+        Node* newNode = new Node(key, val);
+        while (true) {
+            Node* head = buckets[idx].load(std::memory_order_acquire);
+            newNode->next.store(head, std::memory_order_relaxed);
+            if (buckets[idx].compare_exchange_weak(
+                    head, newNode,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire))
+            {
+                return true;
+            }
+        }
+    }
+
+    // Find; returns nullptr if not present or erased
+    V find(const K& key) {
+        std::size_t idx = hasher(key) % BUCKETS;
+        for (Node* cur = buckets[idx].load(std::memory_order_acquire);
+             cur;
+             cur = cur->next.load(std::memory_order_acquire))
+        {
+            if (cur->key == key) {
+                V v = cur->value.load(std::memory_order_acquire);
+                if (v) return v;
+            }
+        }
+        return V();
+    }
+
+    // Logical erase: mark value as default(V)
+    V erase(const K& key) {
+        std::size_t idx = hasher(key) % BUCKETS;
+        for (Node* cur = buckets[idx].load(std::memory_order_acquire);
+             cur;
+             cur = cur->next.load(std::memory_order_acquire))
+        {
+            if (cur->key == key) {
+                V old = cur->value.load(std::memory_order_acquire);
+                if (old && cur->value.compare_exchange_strong(
+                        old, V(),
+                        std::memory_order_acq_rel))
+                {
+                    return old;
+                }
+            }
+        }
+        return V();
+    }
+};
+
+// ==================== OrderBook ====================
+class OrderBook {
+    // BST roots
+    std::atomic<Limit*>    buyTree{nullptr};
+    std::atomic<Limit*>    sellTree{nullptr};
+    // "Inside" pointers
+    std::atomic<Limit*>    highestBuy{nullptr};
+    std::atomic<Limit*>    lowestSell{nullptr};
+
+    // Lock-free maps
+    LockFreeHashMap<int, Order*> orderIndex;
+    LockFreeHashMap<int, Limit*> limitIndex;
+
+public:
+    // Lookup-or-insert a price level in the correct BST
+    Limit* findOrInsertLimit(bool isBuySide, int price) {
+        // 1) try hash-index
+        if (auto L = limitIndex.find(price)) {
+            return L;
+        }
+
+        // 2) BST insert via CAS
+        auto& root = isBuySide ? buyTree : sellTree;
+        while (true) {
+            Limit* parent = nullptr;
+            Limit* cur    = root.load(std::memory_order_acquire);
+            while (cur) {
+                if (price == cur->limitPrice) {
+                    limitIndex.insert(price, cur);
+                    return cur;
+                }
+                parent = cur;
+                cur = (price < cur->limitPrice)
+                      ? cur->leftChild.load(std::memory_order_acquire)
+                      : cur->rightChild.load(std::memory_order_acquire);
+            }
+
+            Limit* newNode = new Limit(price);
+            if (!parent) {
+                // Empty tree
+                if (root.compare_exchange_strong(
+                        cur, newNode,
+                        std::memory_order_acq_rel))
+                {
+                    updateInsidePointer(isBuySide, newNode);
+                    limitIndex.insert(price, newNode);
+                    return newNode;
+                }
+            } else {
+                // Attach under parent
+                auto& link = (price < parent->limitPrice)
+                              ? parent->leftChild
+                              : parent->rightChild;
+                if (link.compare_exchange_strong(
+                        cur, newNode,
+                        std::memory_order_acq_rel))
+                {
+                    newNode->parent.store(parent,
+                                           std::memory_order_release);
+                    updateInsidePointer(isBuySide, newNode);
+                    limitIndex.insert(price, newNode);
+                    return newNode;
+                }
+            }
+
+            delete newNode;
+            // retry
+        }
+    }
+
+    // Insert a new order
+    void onNewOrder(int id, bool buy, int shares,
+                    int price, int entryTime, int eventTime)
+    {
+        Order* o = new Order{id, buy, shares, price,
+                             entryTime, eventTime,
+                             nullptr, nullptr, nullptr};
+        Limit* L = findOrInsertLimit(buy, price);
+
+        // Append to per-limit list (lock-free push to tail)
+        while (true) {
+            Order* tail = L->tailOrder.load(std::memory_order_acquire);
+            o->prevOrder = tail;
+            o->nextOrder = nullptr;
+            if (L->tailOrder.compare_exchange_weak(
+                    tail, o,
+                    std::memory_order_acq_rel))
+            {
+                if (tail) tail->nextOrder = o;
+                else    L->headOrder.store(o,
+                                             std::memory_order_release);
+                break;
+            }
+        }
+        o->parentLimit = L;
+        L->size.fetch_add(1, std::memory_order_relaxed);
+        L->totalVolume.fetch_add(shares, std::memory_order_relaxed);
+        orderIndex.insert(id, o);
+    }
+
+    // Cancel an existing order
+    Order* onCancel(int id) {
+        if (Order* o = orderIndex.erase(id)) {
+            Limit* L = o->parentLimit;
+            Order* prev = o->prevOrder;
+            Order* next = o->nextOrder;
+            if (prev) prev->nextOrder = next;
+            else        L->headOrder.store(next,
+                                            std::memory_order_release);
+            if (next) next->prevOrder = prev;
+            else        L->tailOrder.store(prev,
+                                            std::memory_order_release);
+            L->size.fetch_sub(1, std::memory_order_relaxed);
+            L->totalVolume.fetch_sub(o->shares,
+                                    std::memory_order_relaxed);
+            return o;
+        }
+        return nullptr;
+    }
+
+    // (optional) access best bid/ask
+    Limit* bestBid() const { return highestBuy.load(); }
+    Limit* bestAsk() const { return lowestSell.load(); }
+
+private:
+    // Update highestBuy / lowestSell via CAS
+    void updateInsidePointer(bool isBuySide, Limit* cand) {
         auto& inside = isBuySide ? highestBuy : lowestSell;
-        Limit* old;
+        Limit* old = nullptr;
         while (true) {
             old = inside.load(std::memory_order_acquire);
             if (old) {
-                // for buy side we want max price; for sell min price
-                if ((isBuySide  && old->limitPrice >= candidate->limitPrice) ||
-                    (!isBuySide && old->limitPrice <= candidate->limitPrice))
+                if ((isBuySide  && old->limitPrice >= cand->limitPrice) ||
+                    (!isBuySide && old->limitPrice <= cand->limitPrice))
                 {
-                    return;  // no update needed
+                    return;
                 }
             }
-            // try to swing it to our candidate
-            if (inside.compare_exchange_weak(old, candidate,
-                                             std::memory_order_acq_rel))
+            if (inside.compare_exchange_weak(
+                    old, cand,
+                    std::memory_order_acq_rel))
             {
                 return;
             }
-            // else another thread raced us → retry comparison
         }
     }
 };
